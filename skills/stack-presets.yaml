@@ -1,0 +1,84 @@
+# Shift stack presets — sensible defaults per product type.
+#
+# Used by bin/shift when the user says "whatever you recommend" during intake,
+# and as a grounding anchor for Scout's research prompt so its recommendations
+# don't drift toward exotic stacks for first-time founders.
+#
+# Each preset lists: summary (plain English), stack (technical for agents),
+# hosting (where to deploy), and env_vars (typical API keys the user will need).
+
+web-app:
+  summary: "A website you visit in a browser — users sign up, use the site, come back."
+  stack:
+    frontend: Next.js
+    backend: Next.js API routes
+    database: Postgres (Supabase hosts it for free to start)
+    auth: Supabase Auth or Clerk
+    styling: Tailwind CSS
+  hosting: Vercel (free tier)
+  env_vars:
+    - DATABASE_URL
+    - NEXTAUTH_SECRET
+  deploy_complexity: low
+  why: "Single framework (Next.js) covers frontend + backend. Vercel deploys from GitHub on push — zero config for the first month."
+
+api:
+  summary: "A backend service other apps talk to — phone apps, third-party clients, etc."
+  stack:
+    framework: FastAPI (Python) or Hono (TypeScript)
+    database: Postgres
+    auth: JWT tokens
+  hosting: Railway or Fly.io (free trials)
+  env_vars:
+    - DATABASE_URL
+    - JWT_SECRET
+  deploy_complexity: medium
+  why: "FastAPI auto-generates documentation from code. Hono is smaller/faster if staying in TypeScript. Both deploy cleanly to Railway."
+
+bot:
+  summary: "A chat bot living inside Discord, Slack, or Telegram."
+  stack:
+    framework: discord.py (Discord) | Bolt (Slack) | python-telegram-bot (Telegram)
+    runtime: Python 3.11
+    storage: SQLite (small), Postgres (growing)
+  hosting: Fly.io or Railway (free tier, stays on 24/7)
+  env_vars:
+    - BOT_TOKEN
+    - "CHANNEL_ID (if locked to one channel)"
+  deploy_complexity: low
+  why: "Bots are small stateful processes. Fly.io keeps them running for free until you hit scale."
+
+cli:
+  summary: "A command-line tool other developers install and run from their terminal."
+  stack:
+    language: Python (typer) or Go (cobra) or Rust (clap)
+    distribution: pypi.org (Python) or brew/scoop (Go/Rust)
+  hosting: GitHub Releases
+  env_vars: []
+  deploy_complexity: low
+  why: "CLIs are static binaries. Users install via pip/brew/curl. No server costs."
+
+ml:
+  summary: "A machine-learning model or data pipeline — training, inference, or both."
+  stack:
+    framework: PyTorch (training) | transformers (HF models) | LangChain (LLM apps)
+    data: pandas / polars
+    serving: FastAPI or Modal
+  hosting: Modal.com (GPU-friendly) or Hugging Face Spaces
+  env_vars:
+    - HF_TOKEN
+    - OPENAI_API_KEY
+  deploy_complexity: high
+  why: "GPU hosting is the hard part. Modal abstracts it — define a function, deploy, pay per second of compute."
+
+mobile:
+  summary: "A phone app you install from the iOS or Android app store."
+  stack:
+    framework: React Native (Expo) or Flutter
+    backend: Supabase or Firebase (manages auth + data)
+  hosting: Expo EAS (builds + submits to stores)
+  env_vars:
+    - SUPABASE_URL
+    - SUPABASE_ANON_KEY
+  deploy_complexity: high
+  why: "Expo handles 80% of native-build pain. App store review still takes days — budget for it."

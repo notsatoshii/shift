@@ -1,0 +1,1172 @@
+#!/usr/bin/env python3
+"""
+SHIFT — Proactive AI mentor for CAE projects (v3.0).
+
+Walks a non-technical user from IDEA → PRD → ROADMAP → CAE execution → SHIP.
+State persists in <project-dir>/.shift/state.json across sessions and interfaces.
+
+Usage:
+  shift new <name> [--dir <path>]   Start a new project intake.
+  shift resume [project]            Resume an existing project.
+  shift next                        Propose + execute the next action.
+  shift help                        Read current state, explain, offer 3 fixes.
+  shift status                      Print done/in-progress/blocked/next.
+  shift learn <topic>               Teach about a CAE concept in plain English.
+
+Non-interactive mode (for scripted testing / tri-interface backend):
+  SHIFT_NONINTERACTIVE=1            Skip all input() prompts; fall to defaults
+  SHIFT_ANSWERS=<path-to-json>      Pre-supplied answers keyed by question id
+  SHIFT_AUTO_APPROVE=1              Auto-approve every confirmation gate
+  SHIFT_STUB_SUBPROCESSES=1         Skip Scout/Arch/CAE spawns; write stub files
+                                    (for sanity tests that must finish in seconds)
+
+Reads (CAE-side):
+  config/agent-models.yaml          Role → model routing (reuses Scout/Arch/Herald)
+  adapters/claude-code.sh           Claude subprocess adapter
+  adapters/gemini-cli.sh            Gemini subprocess adapter
+  bin/sentinel.py                   Cross-provider review helper
+  agents/cae-shift.md               Shift's persona (injected into prompts)
+  agents/cae-scout.md               Research persona
+  agents/cae-arch.md                PRD/Roadmap drafting persona
+  skills/shift/stack-presets.yaml   Sensible default stacks
+
+Writes (project-side):
+  <proj>/.shift/state.json          Persistent mentor state
+  <proj>/.shift/research/SCOUT.md   Scout's research brief
+  <proj>/.shift/PRD.md              Arch's plain-English product spec
+  <proj>/.shift/ROADMAP.md          Arch's phase plan
+  <proj>/.shift/.env.example        Env var scaffold
+
+Design notes:
+  - Shift NEVER prints file paths, YAML, or CLI commands to the user during intake.
+  - Every irreversible action (git push, API key use, deploy) has an explicit yes gate.
+  - Research/planning use CAE subprocesses; if a provider is missing we degrade
+    gracefully to the installed one + a stub with clear logging.
+  - State schema is versioned so future Telegram/web interfaces can read/write it
+    safely. Bump STATE_SCHEMA_VERSION when the shape changes.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+VERSION = "3.0.0"
+STATE_SCHEMA_VERSION = 1
+
+# ─── Paths ──────────────────────────────────────────────────────────────
+_THIS = Path(__file__).resolve()
+CAE_ROOT = _THIS.parent.parent
+AGENT_MODELS_PATH = CAE_ROOT / "config" / "agent-models.yaml"
+CLAUDE_ADAPTER = CAE_ROOT / "adapters" / "claude-code.sh"
+GEMINI_ADAPTER = CAE_ROOT / "adapters" / "gemini-cli.sh"
+SHIFT_PERSONA_PATH = CAE_ROOT / "agents" / "cae-shift.md"
+SCOUT_PERSONA_PATH = CAE_ROOT / "agents" / "cae-scout.md"
+ARCH_PERSONA_PATH = CAE_ROOT / "agents" / "cae-arch.md"
+STACK_PRESETS_PATH = CAE_ROOT / "skills" / "shift" / "stack-presets.yaml"
+
+# ─── Utilities ──────────────────────────────────────────────────────────
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_yaml(path: Path):
+    try:
+        import yaml
+    except ImportError:
+        die("PyYAML required (apt install python3-yaml)")
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _is_noninteractive() -> bool:
+    return os.environ.get("SHIFT_NONINTERACTIVE", "").strip() not in ("", "0", "false", "no")
+
+
+def _auto_approve() -> bool:
+    return os.environ.get("SHIFT_AUTO_APPROVE", "").strip() not in ("", "0", "false", "no")
+
+
+def _stub_subprocesses() -> bool:
+    return os.environ.get("SHIFT_STUB_SUBPROCESSES", "").strip() not in ("", "0", "false", "no")
+
+
+def _load_answers() -> dict:
+    """Load pre-supplied answers for non-interactive mode. Keyed by question id."""
+    p = os.environ.get("SHIFT_ANSWERS")
+    if not p:
+        return {}
+    path = Path(p)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+_ANSWERS = _load_answers()
+
+
+def ask(qid: str, question: str, default: Optional[str] = None, explain: Optional[str] = None) -> str:
+    """
+    Ask user ONE question. Respects non-interactive mode.
+    Resolution order: SHIFT_ANSWERS[qid] → prompt → default → empty.
+    """
+    if qid in _ANSWERS:
+        answer = str(_ANSWERS[qid])
+        print(f"  [auto] {question}  →  {answer}")
+        return answer
+    if _is_noninteractive():
+        if default is not None:
+            print(f"  [default] {question}  →  {default}")
+            return default
+        print(f"  [skip] {question}  →  (no answer supplied)")
+        return ""
+    print()
+    if explain:
+        print(f"  (why: {explain})")
+    prompt_suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"  {question}{prompt_suffix} > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default or ""
+    return answer or (default or "")
+
+
+def confirm(qid: str, prompt_text: str, default_yes: bool = True) -> bool:
+    """Yes/no gate. Non-interactive + SHIFT_AUTO_APPROVE → True. Otherwise prompt."""
+    if _auto_approve():
+        print(f"  [auto-approve] {prompt_text}  →  yes")
+        return True
+    if qid in _ANSWERS:
+        v = str(_ANSWERS[qid]).strip().lower()
+        ok = v in ("y", "yes", "true", "1")
+        print(f"  [auto] {prompt_text}  →  {'yes' if ok else 'no'}")
+        return ok
+    if _is_noninteractive():
+        print(f"  [default] {prompt_text}  →  {'yes' if default_yes else 'no'}")
+        return default_yes
+    default_hint = "Y/n" if default_yes else "y/N"
+    try:
+        reply = input(f"  {prompt_text} [{default_hint}] > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not reply:
+        return default_yes
+    return reply in ("y", "yes")
+
+
+def narrate(what: str, why: Optional[str] = None) -> None:
+    """Print a short user-facing status line. Plain English, no jargon."""
+    if why:
+        print(f"\n> {what}\n  {why}")
+    else:
+        print(f"\n> {what}")
+
+
+# ─── State management ──────────────────────────────────────────────────
+def _default_state(project_name: str, project_dir: Path) -> dict:
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "shift_version": VERSION,
+        "project_name": project_name,
+        "project_dir": str(project_dir),
+        "created": _now(),
+        "updated": _now(),
+        "phase": "idea",
+        "idea": {
+            "raw_intake": "",
+            "questions_asked": [],
+            "answers": [],
+            "summary": "",
+            "target_user": "",
+            "product_type": "",    # web-app / api / bot / cli / ml / ...
+        },
+        "research": {
+            "scout_brief_path": "",
+            "completed": False,
+            "stack_recommendation": "",
+        },
+        "prd": {
+            "path": "",
+            "user_approved": False,
+            "revisions": 0,
+        },
+        "roadmap": {
+            "path": "",
+            "user_approved": False,
+            "revisions": 0,
+            "phases": [],
+        },
+        "execute": {
+            "current_phase": 0,
+            "total_phases": 0,
+            "status": "not_started",
+            "tmux_session": "",
+        },
+        "uat": {"notes": []},
+        "ship": {"github_url": "", "deployed": False},
+        "env_vars": {
+            "collected": {},     # name → stored-where marker (never store raw values)
+            "remaining": [],
+        },
+        "history": [],
+        "next_action": "Capture your idea (run: shift new or answer the intake).",
+    }
+
+
+def state_path_for(project_dir: Path) -> Path:
+    return project_dir / ".shift" / "state.json"
+
+
+def load_state(project_dir: Path) -> dict:
+    p = state_path_for(project_dir)
+    if not p.exists():
+        die(f"no Shift project at {project_dir} (no .shift/state.json). Run: shift new <name>")
+    return json.loads(p.read_text())
+
+
+def save_state(state: dict) -> None:
+    state["updated"] = _now()
+    p = state_path_for(Path(state["project_dir"]))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2))
+
+
+def record(state: dict, action: str, outcome: str) -> None:
+    state["history"].append({"ts": _now(), "action": action, "outcome": outcome})
+
+
+def set_next(state: dict, text: str) -> None:
+    state["next_action"] = text
+
+
+# ─── Subprocess spawn helpers ──────────────────────────────────────────
+def _session_id(prefix: str) -> str:
+    return f"shift-{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _spawn_claude(prompt_path: Path, model: str, session_id: str,
+                  system_prompt_file: Optional[Path] = None,
+                  agent: Optional[str] = None,
+                  effort: str = "max",
+                  timeout: int = 1800) -> dict:
+    """
+    Invoke adapters/claude-code.sh. Returns dict with output_path, output_text, exit_code.
+    Must pass exactly one of system_prompt_file / agent.
+    """
+    if not CLAUDE_ADAPTER.exists():
+        return {"exit_code": 127, "output_path": None, "output_text": "",
+                "error": "claude adapter missing"}
+    cmd = [str(CLAUDE_ADAPTER), str(prompt_path), model, session_id,
+           "--effort", effort, "--timeout", str(timeout)]
+    if agent:
+        cmd.extend(["--agent", agent])
+    elif system_prompt_file:
+        cmd.extend(["--system-prompt-file", str(system_prompt_file)])
+    else:
+        return {"exit_code": 3, "output_path": None, "output_text": "",
+                "error": "must specify agent or system_prompt_file"}
+    try:
+        result = subprocess.run(cmd, capture_output=False)
+    except FileNotFoundError as e:
+        return {"exit_code": 127, "output_path": None, "output_text": "", "error": str(e)}
+    out_path = Path(str(prompt_path) + ".output")
+    return {
+        "exit_code": result.returncode,
+        "output_path": out_path if out_path.exists() else None,
+        "output_text": out_path.read_text() if out_path.exists() else "",
+        "error": "",
+    }
+
+
+def _gemini_available() -> bool:
+    try:
+        r = subprocess.run(["which", "gemini"], capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _spawn_gemini(prompt_path: Path, model: str, session_id: str,
+                  system_prompt_file: Optional[Path] = None,
+                  timeout: int = 600) -> dict:
+    """Invoke adapters/gemini-cli.sh. Degrades gracefully if Gemini missing."""
+    if not _gemini_available():
+        return {"exit_code": 127, "output_path": None, "output_text": "",
+                "error": "gemini CLI not on PATH"}
+    if not GEMINI_ADAPTER.exists():
+        return {"exit_code": 127, "output_path": None, "output_text": "",
+                "error": "gemini adapter missing"}
+    cmd = ["bash", str(GEMINI_ADAPTER), str(prompt_path), model, session_id,
+           "--timeout", str(timeout)]
+    if system_prompt_file:
+        cmd.extend(["--system-prompt-file", str(system_prompt_file)])
+    try:
+        result = subprocess.run(cmd, capture_output=False)
+    except FileNotFoundError as e:
+        return {"exit_code": 127, "output_path": None, "output_text": "", "error": str(e)}
+    out_path = Path(str(prompt_path) + ".output")
+    return {
+        "exit_code": result.returncode,
+        "output_path": out_path if out_path.exists() else None,
+        "output_text": out_path.read_text() if out_path.exists() else "",
+        "error": "",
+    }
+
+
+def _read_persona() -> str:
+    return SHIFT_PERSONA_PATH.read_text() if SHIFT_PERSONA_PATH.exists() else ""
+
+
+# ─── Stack presets ─────────────────────────────────────────────────────
+def load_presets() -> dict:
+    if not STACK_PRESETS_PATH.exists():
+        return {}
+    return load_yaml(STACK_PRESETS_PATH) or {}
+
+
+def classify_product_type(raw: str) -> str:
+    """Very light heuristic. Returns one of web-app / api / bot / cli / ml / mobile."""
+    r = raw.lower()
+    if any(k in r for k in ("website", "web app", "webapp", "dashboard", "saas", "browser", "page")):
+        return "web-app"
+    if any(k in r for k in ("mobile", "ios", "android", "phone app", "app store")):
+        return "mobile"
+    if any(k in r for k in ("discord", "slack", "telegram bot", "chatbot", " bot")):
+        return "bot"
+    if any(k in r for k in ("api ", " api", "endpoint", "backend service", "microservice")):
+        return "api"
+    if any(k in r for k in ("cli", "command line", "terminal tool")):
+        return "cli"
+    if any(k in r for k in ("model", "ml ", "machine learning", "neural", "ai model", "training")):
+        return "ml"
+    return "web-app"  # most common first-project default
+
+
+# ─── Phase handlers ────────────────────────────────────────────────────
+def phase_idea(state: dict) -> None:
+    """Conversational intake — ONE question at a time, plain English."""
+    proj_dir = Path(state["project_dir"])
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    (proj_dir / ".shift").mkdir(parents=True, exist_ok=True)
+
+    narrate(
+        f"Starting '{state['project_name']}'.",
+        "I'll walk you through this one step at a time. You can stop anytime — "
+        "type 'shift resume' later to pick up exactly where we left off."
+    )
+
+    # Q1: what are you building?
+    if not state["idea"]["raw_intake"]:
+        raw = ask(
+            "idea.what",
+            "What are you building? One or two sentences is fine.",
+            default="A web app that does something useful",
+            explain="Don't worry about technical details — just tell me the idea.",
+        )
+        state["idea"]["raw_intake"] = raw
+        state["idea"]["questions_asked"].append("what")
+        state["idea"]["answers"].append(raw)
+
+    # Q2: who is it for?
+    if not state["idea"]["target_user"]:
+        tu = ask(
+            "idea.who",
+            "Who is this for? One sentence.",
+            default="General consumers",
+            explain="Knowing the audience helps me pick the right defaults later.",
+        )
+        state["idea"]["target_user"] = tu
+        state["idea"]["questions_asked"].append("who")
+        state["idea"]["answers"].append(tu)
+
+    # Q3: product type (auto-classify; confirm)
+    if not state["idea"]["product_type"]:
+        guess = classify_product_type(state["idea"]["raw_intake"])
+        readable = {
+            "web-app": "a website you visit in a browser",
+            "api": "a backend service other apps talk to",
+            "bot": "a chat bot (Discord/Slack/Telegram)",
+            "cli": "a command-line tool",
+            "ml": "a machine-learning model or pipeline",
+            "mobile": "a phone app",
+        }.get(guess, guess)
+        narrate(
+            f"I'm going to assume this is {readable}.",
+            "If that's wrong, say 'no' and I'll ask."
+        )
+        ok = confirm("idea.type_ok", f"Is this {readable}?", default_yes=True)
+        if ok:
+            state["idea"]["product_type"] = guess
+        else:
+            alt = ask(
+                "idea.type_alt",
+                "What kind is it? (web-app / api / bot / cli / ml / mobile)",
+                default="web-app",
+            ).strip().lower()
+            state["idea"]["product_type"] = alt or guess
+
+    # Synthesize intake summary
+    state["idea"]["summary"] = (
+        f"{state['project_name']}: {state['idea']['raw_intake']} "
+        f"(for: {state['idea']['target_user']}, type: {state['idea']['product_type']})"
+    )
+    narrate(
+        "Got it — here's what I heard:",
+        state["idea"]["summary"],
+    )
+
+    record(state, "idea_captured", state["idea"]["summary"])
+    state["phase"] = "research"
+    set_next(state, "Research your stack (I'll use Scout to investigate what to build this with).")
+    save_state(state)
+
+
+def phase_research(state: dict) -> None:
+    """Spawn Scout (Gemini primary, Claude fallback) to research the stack."""
+    proj_dir = Path(state["project_dir"])
+    research_dir = proj_dir / ".shift" / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+
+    narrate(
+        "Researching your stack.",
+        "I'm asking my researcher (Scout) to figure out the best tools for what you're building. "
+        "This takes about a minute."
+    )
+
+    presets = load_presets()
+    preset = presets.get(state["idea"]["product_type"], {})
+
+    prompt_path = research_dir / "scout-prompt.md"
+    prompt_path.write_text(f"""<task>
+Produce a research brief for this project. Target file: `.shift/research/SCOUT.md`.
+
+Project: {state['project_name']}
+Idea: {state['idea']['raw_intake']}
+Audience: {state['idea']['target_user']}
+Product type: {state['idea']['product_type']}
+
+Constraints:
+- Non-technical founder will read this summary. Use plain English.
+- Recommend a stack using CAE's preset for {state['idea']['product_type']} as default if nothing
+  in the idea contradicts it.
+- Flag any external services that will need API keys (user has to create accounts).
+- Call out 1-2 reference products that solve similar problems.
+- Keep under 1500 tokens.
+
+Default preset (if nothing contradicts):
+{json.dumps(preset, indent=2) if preset else '(none)'}
+</task>
+
+<format>
+Write output directly into `{research_dir / 'SCOUT.md'}` as markdown with these sections:
+  # Research — {state['project_name']}
+  ## TL;DR
+  ## Recommended stack
+  ## API keys / accounts the user will need
+  ## Reference products
+  ## Pitfalls to watch for
+
+When done, print 'RESEARCH WRITTEN'.
+</format>
+""")
+
+    sid = _session_id("scout")
+    if _stub_subprocesses():
+        # Sanity-test mode: write a deterministic stub brief instead of spawning.
+        stub = (
+            f"# Research — {state['project_name']}\n\n"
+            f"## TL;DR\n(stub) {state['idea']['product_type']} for {state['idea']['target_user']}.\n\n"
+            f"## Recommended stack\n"
+            f"{json.dumps(preset, indent=2) if preset else '(default preset)'}\n\n"
+            f"## API keys / accounts the user will need\n- (stub) Supabase\n- (stub) Vercel\n\n"
+            f"## Reference products\n- (stub) example-app.com\n\n"
+            f"## Pitfalls to watch for\n- (stub) run real Scout in production\n"
+        )
+        (research_dir / "SCOUT.md").write_text(stub)
+        r = {"exit_code": 0, "output_path": research_dir / "SCOUT.md", "output_text": stub, "error": ""}
+    elif _gemini_available():
+        # Try Gemini first (Scout's preferred model). Fallback to Claude Sonnet.
+        r = _spawn_gemini(prompt_path, "gemini-2.5-pro", sid,
+                          system_prompt_file=SCOUT_PERSONA_PATH, timeout=600)
+    else:
+        narrate("(My researcher runs best on Gemini, but it's not installed here — using Claude instead.)")
+        r = _spawn_claude(prompt_path, "claude-sonnet-4-6", sid,
+                          system_prompt_file=SCOUT_PERSONA_PATH, effort="max", timeout=900)
+
+    brief_path = research_dir / "SCOUT.md"
+    # If the model wrote the file directly, great. If it only produced stdout, capture that.
+    if not brief_path.exists() and r.get("output_text"):
+        # Fallback: dump stdout into SCOUT.md so the user still gets a brief.
+        brief_path.write_text(r["output_text"])
+
+    if brief_path.exists():
+        state["research"]["scout_brief_path"] = str(brief_path.relative_to(proj_dir))
+        state["research"]["completed"] = True
+        # Extract first bold line as stack recommendation summary (best-effort)
+        txt = brief_path.read_text()
+        m = re.search(r"(?im)^##\s*Recommended stack\s*\n+(.+)$", txt)
+        if m:
+            state["research"]["stack_recommendation"] = m.group(1).strip()[:200]
+        narrate(
+            "Research done.",
+            "I've saved a brief summary. You can always review it with `shift status`."
+        )
+        record(state, "research_completed", str(brief_path))
+    else:
+        narrate(
+            "Research stalled — my researcher didn't produce a brief.",
+            "No harm done. I'll use a sensible default stack for this type of project and keep going."
+        )
+        record(state, "research_stubbed", "no output from scout; using preset")
+        state["research"]["completed"] = True
+        state["research"]["stack_recommendation"] = str(preset.get("summary", "default preset"))
+
+    state["phase"] = "prd"
+    set_next(state, "Draft the product spec (PRD) that describes what we're building.")
+    save_state(state)
+
+
+def phase_prd(state: dict) -> None:
+    """Spawn Arch (Claude Opus via gsd-planner wrap) to draft a plain-English PRD."""
+    proj_dir = Path(state["project_dir"])
+    prd_path = proj_dir / ".shift" / "PRD.md"
+
+    narrate(
+        "Drafting your product spec.",
+        "This is a plain-English document that describes what we're building, for whom, "
+        "and what 'done' looks like. I'll show it to you before anything is built."
+    )
+
+    scout_brief = ""
+    scout_path = proj_dir / state["research"].get("scout_brief_path", "")
+    if scout_path.exists():
+        scout_brief = scout_path.read_text()[:6000]
+
+    work_dir = proj_dir / ".shift" / "arch"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = work_dir / "prd-prompt.md"
+    prompt_path.write_text(f"""<persona>
+{ARCH_PERSONA_PATH.read_text() if ARCH_PERSONA_PATH.exists() else ''}
+</persona>
+
+<task>
+Draft a PRD (Product Requirements Document) for this project, at `{prd_path}`.
+
+CRITICAL — audience is a NON-TECHNICAL founder. Every section must be readable
+by someone who cannot code. No file paths, no API names, no stack jargon unless
+defined in-line.
+
+Project: {state['project_name']}
+Idea: {state['idea']['raw_intake']}
+Audience: {state['idea']['target_user']}
+Type: {state['idea']['product_type']}
+
+Scout's research brief:
+{scout_brief or '(no brief available — use your best judgment)'}
+</task>
+
+<format>
+Write `{prd_path}` with EXACTLY these sections:
+
+# {state['project_name']} — Product Requirements
+
+## What it is
+One paragraph, plain English.
+
+## Who it's for
+One paragraph describing the target user and their current pain.
+
+## What a user can do (core flows)
+3-6 bullet points, each a complete user story in plain English:
+"As a [user], I can [action] so that [outcome]."
+
+## What it looks like
+Plain-English description of the main screens/surfaces — just enough that
+the user can visualize. No UI framework jargon.
+
+## What's NOT in v1
+Explicit list of things we're deferring. Protect scope.
+
+## How we'll know it works
+3-5 testable success criteria, each in plain English.
+
+## Tech approach (one paragraph, plain English)
+Name the main pieces — "a website built with [framework], data stored in a
+[database type], hosted on [provider]." If you mention a technology, add a
+one-line in-plain-English explanation the first time.
+
+Target length: 200-400 lines. Print 'PRD WRITTEN' when done.
+</format>
+""")
+
+    sid = _session_id("arch-prd")
+    if _stub_subprocesses():
+        stub = (
+            f"# {state['project_name']} — Product Requirements\n\n"
+            f"## What it is\n(stub) {state['idea']['raw_intake']}\n\n"
+            f"## Who it's for\n(stub) {state['idea']['target_user']}\n\n"
+            f"## What a user can do (core flows)\n"
+            f"- As a user, I can do the main thing so that the problem is solved.\n"
+            f"- As a user, I can come back later so that I can continue.\n\n"
+            f"## What it looks like\n(stub) Clean, minimal web UI.\n\n"
+            f"## What's NOT in v1\n- Payments\n- Team features\n\n"
+            f"## How we'll know it works\n- A user can complete the main flow end-to-end.\n\n"
+            f"## Tech approach\n(stub) Default {state['idea']['product_type']} stack.\n"
+        )
+        prd_path.write_text(stub)
+        r = {"exit_code": 0, "output_path": prd_path, "output_text": stub, "error": ""}
+    else:
+        r = _spawn_claude(prompt_path, "claude-opus-4-6", sid,
+                          agent="gsd-planner", effort="max", timeout=1800)
+
+    # If wrap didn't write the file, attempt to extract from output_text.
+    if not prd_path.exists() and r.get("output_text"):
+        # Arch might have produced the PRD inline — try to write what we got.
+        body = r["output_text"]
+        # Strip wrapping noise like "PRD WRITTEN" and excerpt the markdown if present.
+        m = re.search(r"(#\s+" + re.escape(state['project_name']) + r".*?)(?=\nPRD WRITTEN|$)", body, re.DOTALL)
+        if m:
+            prd_path.write_text(m.group(1))
+
+    if prd_path.exists():
+        state["prd"]["path"] = str(prd_path.relative_to(proj_dir))
+        record(state, "prd_drafted", state["prd"]["path"])
+        narrate(
+            "PRD drafted.",
+            f"I've saved the product spec. You can review it by opening `.shift/PRD.md` in "
+            f"the project folder, or by running `shift status`. "
+            f"Once you're happy with it, approve and I'll turn it into a build plan."
+        )
+        # Approve gate
+        if confirm("prd.approve", "Approve the PRD and move on to the build roadmap?", default_yes=True):
+            state["prd"]["user_approved"] = True
+            state["phase"] = "roadmap"
+            set_next(state, "Break the PRD into an ordered build plan (roadmap).")
+        else:
+            set_next(state, "Revise the PRD — run `shift next` after you've told me what to change, "
+                            "or edit `.shift/PRD.md` directly and re-approve.")
+            state["prd"]["revisions"] += 1
+    else:
+        narrate(
+            "Couldn't draft the PRD this run.",
+            "My architect didn't produce a file. Options: (1) retry with `shift next`, "
+            "(2) write a rough PRD yourself and I'll improve it, (3) skip PRD and go straight to roadmap."
+        )
+        record(state, "prd_failed", "no file produced")
+        set_next(state, "Retry PRD drafting with `shift next`, or write `.shift/PRD.md` manually.")
+
+    save_state(state)
+
+
+def phase_roadmap(state: dict) -> None:
+    """Spawn Arch again to break PRD into a phased roadmap."""
+    proj_dir = Path(state["project_dir"])
+    roadmap_path = proj_dir / ".shift" / "ROADMAP.md"
+    prd_path = proj_dir / state["prd"].get("path", ".shift/PRD.md")
+
+    narrate(
+        "Turning the PRD into a build plan.",
+        "I'll break the work into 3-6 phases, each one shippable on its own. "
+        "You approve the plan, then CAE starts building phase 1."
+    )
+
+    prd_text = prd_path.read_text() if prd_path.exists() else ""
+    work_dir = proj_dir / ".shift" / "arch"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = work_dir / "roadmap-prompt.md"
+    prompt_path.write_text(f"""<persona>
+{ARCH_PERSONA_PATH.read_text() if ARCH_PERSONA_PATH.exists() else ''}
+</persona>
+
+<task>
+Produce a roadmap for this project at `{roadmap_path}`. Break the PRD into 3-6 phases
+that ship incrementally. Each phase must be shippable on its own (end-user sees value).
+
+Non-technical audience — describe what each phase delivers in plain English, not file names.
+
+HARD RULES:
+- NO timelines. NO days, weeks, months, hours. NO "~1 day" / "takes 2 weeks" / "sprint N".
+- NO calendar dates. NO "Q1" / "by Friday" / "early next month".
+- NO effort estimates. NO "small/medium/large" sizing either.
+- Roadmap = ordered steps. Order = what ships first, not when.
+- If the user asks "how long will this take?" the answer is "depends on CAE throughput, not something we estimate here."
+
+PRD:
+{prd_text[:10000]}
+</task>
+
+<format>
+Write `{roadmap_path}`:
+
+# {state['project_name']} — Roadmap
+
+## Overview
+One paragraph: the arc from phase 1 to the final shipped product.
+
+## Phase 1 — [name]
+**Goal:** (one sentence in plain English — what the user can do after this phase)
+**Why this first:** (one sentence)
+**What it includes:** 3-5 bullets
+**Definition of done:** 2-3 testable criteria
+
+## Phase 2 — ...
+(same structure)
+
+...continue up to ~6 phases total.
+
+## What we'll defer to a v2 or later
+Bullet list of things explicitly NOT in this roadmap.
+
+Target 150-350 lines. Print 'ROADMAP WRITTEN' when done.
+</format>
+""")
+
+    sid = _session_id("arch-roadmap")
+    if _stub_subprocesses():
+        stub = (
+            f"# {state['project_name']} — Roadmap\n\n"
+            f"## Overview\n(stub) Three phases shipping incrementally.\n\n"
+            f"## Phase 1 — Core MVP\n"
+            f"**Goal:** user can do the main thing end-to-end.\n"
+            f"**Why this first:** proves the core hypothesis.\n"
+            f"**What it includes:** core flow, minimal UI, basic data persistence.\n"
+            f"**Definition of done:** a user completes the main flow.\n\n"
+            f"## Phase 2 — Polish\n"
+            f"**Goal:** product feels real.\n"
+            f"**Why this:** adoption requires polish.\n"
+            f"**What it includes:** styling, error handling, onboarding.\n"
+            f"**Definition of done:** 5 test users report it feels finished.\n\n"
+            f"## Phase 3 — Ship\n"
+            f"**Goal:** live for real users.\n"
+            f"**Why this:** stops being a prototype.\n"
+            f"**What it includes:** deploy, basic analytics.\n"
+            f"**Definition of done:** public URL reachable, usage tracked.\n\n"
+            f"## What we'll defer to a v2 or later\n- Payments\n- Teams\n"
+        )
+        roadmap_path.write_text(stub)
+        r = {"exit_code": 0, "output_path": roadmap_path, "output_text": stub, "error": ""}
+    else:
+        r = _spawn_claude(prompt_path, "claude-opus-4-6", sid,
+                          agent="gsd-planner", effort="max", timeout=1800)
+
+    if not roadmap_path.exists() and r.get("output_text"):
+        body = r["output_text"]
+        m = re.search(r"(#\s+" + re.escape(state['project_name']) + r".*?)(?=\nROADMAP WRITTEN|$)", body, re.DOTALL)
+        if m:
+            roadmap_path.write_text(m.group(1))
+
+    if roadmap_path.exists():
+        state["roadmap"]["path"] = str(roadmap_path.relative_to(proj_dir))
+        # Count phases (## Phase N — ...)
+        txt = roadmap_path.read_text()
+        phases = re.findall(r"(?im)^##\s+Phase\s+(\d+)\s*[—\-:]\s*(.+)$", txt)
+        state["roadmap"]["phases"] = [{"num": int(n), "name": name.strip()} for n, name in phases]
+        state["execute"]["total_phases"] = len(phases)
+        record(state, "roadmap_drafted", state["roadmap"]["path"])
+        narrate(
+            f"Roadmap drafted — {len(phases)} phases.",
+            "Review it in `.shift/ROADMAP.md` or via `shift status`. "
+            "Approving kicks off the build for phase 1."
+        )
+        if confirm("roadmap.approve", "Approve the roadmap and start building phase 1?", default_yes=True):
+            state["roadmap"]["user_approved"] = True
+            state["phase"] = "execute"
+            state["execute"]["current_phase"] = 1
+            set_next(state, "Kick off the build for phase 1.")
+        else:
+            set_next(state, "Revise the roadmap, then run `shift next`.")
+            state["roadmap"]["revisions"] += 1
+    else:
+        narrate(
+            "Couldn't draft the roadmap this run.",
+            "Options: (1) retry with `shift next`, (2) write `.shift/ROADMAP.md` yourself, "
+            "(3) go straight to CAE with manual phases."
+        )
+        record(state, "roadmap_failed", "no file produced")
+        set_next(state, "Retry roadmap drafting with `shift next`.")
+
+    save_state(state)
+
+
+def phase_execute(state: dict) -> None:
+    """Hand off to `cae execute-phase N` in detached tmux. Shift polls for completion."""
+    proj_dir = Path(state["project_dir"])
+    cur = state["execute"]["current_phase"]
+    total = state["execute"]["total_phases"]
+
+    if cur == 0 or cur > total:
+        narrate("No phase to execute.", "Check the roadmap with `shift status`.")
+        return
+
+    # Safety: CAE needs .planning/phases/<N>-*/PLAN.md files. Shift v3.0 doesn't
+    # generate those yet — that's a gap we flag clearly.
+    planning_dir = proj_dir / ".planning" / "phases"
+    padded = f"{cur:02d}"
+    has_plans = planning_dir.is_dir() and bool(list(planning_dir.glob(f"{padded}-*")))
+
+    if not has_plans:
+        narrate(
+            f"Ready to start phase {cur}, but the detailed plan for it hasn't been written yet.",
+            "CAE needs per-phase PLAN.md files under `.planning/phases/` before it can build. "
+            "In v3.0 you or I can write those manually; in v3.1 Shift will auto-generate them. "
+            "For now I'll stop here — say 'shift next' after the plan is ready."
+        )
+        state["execute"]["status"] = "waiting_for_plans"
+        set_next(state, f"Write .planning/phases/{padded}-*/PLAN.md for phase {cur}, then `shift next`.")
+        record(state, "execute_blocked", f"no plans for phase {cur}")
+        save_state(state)
+        return
+
+    narrate(
+        f"Starting build for phase {cur} of {total}.",
+        "This runs in the background. I'll let you know when it's done or if it needs your input."
+    )
+
+    if _stub_subprocesses():
+        state["execute"]["status"] = "stubbed"
+        state["execute"]["tmux_session"] = "(stub — no tmux spawned)"
+        narrate("(stub mode: skipping real CAE spawn)")
+        record(state, "execute_stubbed", f"phase={cur}")
+        set_next(state, f"Real build would be running; in stub mode it's a no-op.")
+        save_state(state)
+        return
+
+    tmux_session = f"shift-exec-{state['project_name']}-p{cur}"
+    # Launch detached tmux: `cae execute-phase <N>`
+    # Detached so the shift process can return control to user.
+    cae_bin = CAE_ROOT / "bin" / "cae"
+    log_path = proj_dir / ".shift" / f"execute-phase-{cur}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    inner = f"cd {proj_dir} && {cae_bin} execute-phase {cur} 2>&1 | tee {log_path}"
+
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", tmux_session],
+                       capture_output=True, check=False)
+        r = subprocess.run(["tmux", "new-session", "-d", "-s", tmux_session, inner],
+                           capture_output=True, text=True, check=False)
+        if r.returncode == 0:
+            state["execute"]["status"] = "running"
+            state["execute"]["tmux_session"] = tmux_session
+            narrate(
+                "Build started.",
+                f"It's running in the background (tmux session: {tmux_session}). "
+                f"Run `shift status` to check progress."
+            )
+            record(state, "execute_started", f"phase={cur} tmux={tmux_session}")
+            set_next(state, f"Wait for phase {cur} to finish, then `shift next` to move on.")
+        else:
+            narrate(
+                "Couldn't start the build.",
+                "tmux failed. Options: (1) retry with `shift next`, (2) run `cae execute-phase` manually."
+            )
+            state["execute"]["status"] = "launch_failed"
+            record(state, "execute_launch_failed", r.stderr.strip()[:300])
+            set_next(state, "Retry build with `shift next`.")
+    except FileNotFoundError:
+        narrate(
+            "tmux isn't installed here.",
+            "Install tmux (`apt install tmux`) or run `cae execute-phase` manually."
+        )
+        state["execute"]["status"] = "no_tmux"
+
+    save_state(state)
+
+
+# ─── Commands ──────────────────────────────────────────────────────────
+def cmd_new(args: list[str]) -> None:
+    if not args:
+        die("usage: shift new <project-name> [--dir <path>]")
+    name = args[0]
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-")
+    if not safe_name:
+        die(f"invalid project name: {name}")
+
+    # --dir flag
+    dir_arg = None
+    if "--dir" in args:
+        i = args.index("--dir")
+        if i + 1 < len(args):
+            dir_arg = args[i + 1]
+
+    if dir_arg:
+        project_dir = Path(dir_arg).expanduser().resolve()
+    else:
+        default_base = Path(os.environ.get("SHIFT_PROJECTS_HOME", str(Path.home() / "projects"))).expanduser()
+        project_dir = default_base / safe_name
+
+    if state_path_for(project_dir).exists():
+        die(f"project already initialized at {project_dir}. Use `shift resume` instead.")
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+    state = _default_state(safe_name, project_dir)
+    save_state(state)
+    record(state, "project_created", str(project_dir))
+    save_state(state)
+
+    # Walk the intake sequence until a phase needs asynchronous waiting.
+    phase_idea(state)
+    if state["phase"] == "research":
+        phase_research(state)
+    if state["phase"] == "prd":
+        phase_prd(state)
+    if state["phase"] == "roadmap" and state["prd"].get("user_approved"):
+        phase_roadmap(state)
+    if state["phase"] == "execute" and state["roadmap"].get("user_approved"):
+        phase_execute(state)
+
+    print()
+    narrate(
+        "Intake done.",
+        f"Your project is at `{project_dir}`. "
+        f"Next: {state['next_action']}"
+    )
+
+
+def _find_project(project_hint: Optional[str]) -> Path:
+    """Resolve a project-name or path to a project_dir containing .shift/state.json."""
+    # 1. If project_hint is a path with state, use it.
+    if project_hint:
+        p = Path(project_hint).expanduser()
+        if state_path_for(p).exists():
+            return p
+        # Try as a project name under $SHIFT_PROJECTS_HOME or ~/projects
+        base = Path(os.environ.get("SHIFT_PROJECTS_HOME", str(Path.home() / "projects"))).expanduser()
+        candidate = base / project_hint
+        if state_path_for(candidate).exists():
+            return candidate
+        die(f"no Shift project found for '{project_hint}'")
+    # 2. cwd has a state file?
+    if state_path_for(Path.cwd()).exists():
+        return Path.cwd()
+    # 3. cwd's parents have one?
+    for anc in Path.cwd().parents:
+        if state_path_for(anc).exists():
+            return anc
+    die("no Shift project found in current directory. Specify a project name or cd into one.")
+
+
+def cmd_resume(args: list[str]) -> None:
+    project_hint = args[0] if args else None
+    proj_dir = _find_project(project_hint)
+    state = load_state(proj_dir)
+    narrate(
+        f"Resuming '{state['project_name']}'.",
+        f"Currently in the '{state['phase']}' phase. "
+        f"Next: {state['next_action']}"
+    )
+    cmd_status_print(state)
+
+
+def cmd_next(args: list[str]) -> None:
+    proj_dir = _find_project(args[0] if args else None)
+    state = load_state(proj_dir)
+
+    phase = state["phase"]
+    narrate(f"Running next action in phase '{phase}'.", state["next_action"])
+
+    if phase == "idea":
+        phase_idea(state)
+    elif phase == "research":
+        phase_research(state)
+    elif phase == "prd":
+        phase_prd(state)
+    elif phase == "roadmap":
+        phase_roadmap(state)
+    elif phase == "execute":
+        phase_execute(state)
+    elif phase == "uat":
+        narrate(
+            "We're in UAT (user acceptance testing).",
+            "You walk through what was built, tell me what's broken or missing, and I'll iterate."
+        )
+    elif phase == "ship":
+        narrate(
+            "Shipping is the final step.",
+            "v3.0 stops here — deploy and custom-domain automation arrives in a later release."
+        )
+    else:
+        narrate(f"Unknown phase '{phase}'.", "Run `shift help` for unstuck options.")
+
+
+def cmd_status_print(state: dict) -> None:
+    print()
+    print(f"=== {state['project_name']} — Shift status ===")
+    print(f"  Phase: {state['phase']}")
+    print(f"  Created: {state['created']}")
+    print(f"  Last updated: {state['updated']}")
+    print()
+    print("  Done:")
+    if state["idea"].get("summary"):
+        print(f"    - Captured your idea")
+    if state["research"].get("completed"):
+        print(f"    - Research brief: .shift/research/SCOUT.md")
+    if state["prd"].get("user_approved"):
+        print(f"    - PRD approved: .shift/PRD.md")
+    if state["roadmap"].get("user_approved"):
+        total = len(state["roadmap"].get("phases", []))
+        print(f"    - Roadmap approved ({total} phases): .shift/ROADMAP.md")
+    if state["execute"].get("current_phase", 0) > 0:
+        cur = state["execute"]["current_phase"]
+        st = state["execute"]["status"]
+        print(f"    - Building phase {cur} — status: {st}")
+
+    print()
+    print("  In progress / blocked:")
+    if state["prd"].get("path") and not state["prd"].get("user_approved"):
+        print(f"    - PRD awaiting your approval (.shift/PRD.md)")
+    if state["roadmap"].get("path") and not state["roadmap"].get("user_approved"):
+        print(f"    - Roadmap awaiting your approval (.shift/ROADMAP.md)")
+    if state["execute"].get("status") == "waiting_for_plans":
+        print(f"    - Phase plans need writing under .planning/phases/")
+
+    print()
+    print(f"  Next: {state['next_action']}")
+    print()
+
+
+def cmd_status(args: list[str]) -> None:
+    proj_dir = _find_project(args[0] if args else None)
+    state = load_state(proj_dir)
+    cmd_status_print(state)
+
+
+def cmd_help_contextual(args: list[str]) -> None:
+    """Read state, explain in plain English, offer 3 unstuck options."""
+    try:
+        proj_dir = _find_project(args[0] if args else None)
+        state = load_state(proj_dir)
+    except SystemExit:
+        # No project yet — fall through to generic help.
+        print(HELP_TEXT)
+        return
+
+    phase = state["phase"]
+    print()
+    print(f"=== Shift help — '{state['project_name']}' ===")
+    phase_explainers = {
+        "idea": "We're still capturing the idea. You've answered some intake questions; "
+                "we haven't started research yet.",
+        "research": "Scout is researching (or just finished) the best stack for your idea.",
+        "prd": "The PRD (plain-English product spec) is being drafted, or waiting for your approval.",
+        "roadmap": "The roadmap (how we'll build it, phase by phase) is drafting or waiting for you.",
+        "execute": "CAE is building (or about to build) a phase from the roadmap.",
+        "uat": "You're reviewing what was built. Tell me what's wrong or missing.",
+        "ship": "Final step — push to GitHub, optionally deploy.",
+    }
+    print(f"  You're in phase: {phase}")
+    print(f"  What that means: {phase_explainers.get(phase, '(unknown phase)')}")
+    print(f"  Next action: {state['next_action']}")
+    print()
+    print("  Three things you can do right now:")
+    print("    1. Run `shift next` — I'll do the next step and ask you to approve.")
+    print(f"    2. Run `shift status` — see everything in one screen.")
+    print(f"    3. Open the project folder and edit .shift/PRD.md or .shift/ROADMAP.md directly.")
+    print()
+
+
+def cmd_learn(args: list[str]) -> None:
+    topic = " ".join(args).strip().lower() if args else ""
+    if not topic:
+        print("Topics: cae, forge, sentinel, scout, arch, herald, phase, tmux, env-vars")
+        return
+    explainers = {
+        "cae": "CAE is the coding team. Shift hands off to it when you approve the roadmap — "
+               "then a set of agents (Forge builds, Sentinel reviews, Scribe learns) runs "
+               "in the background to ship each phase.",
+        "forge": "Forge writes code. It's one of CAE's agents. Shift never calls it directly — "
+                 "it runs inside CAE when you build a phase.",
+        "sentinel": "Sentinel reviews Forge's work using a DIFFERENT AI model (currently Gemini), "
+                    "so you get a second opinion before anything merges.",
+        "scout": "Scout researches. It reads documentation, APIs, and reference products so the "
+                 "rest of the team doesn't waste time guessing.",
+        "arch": "Arch is the architect. It decides how pieces fit together and writes the PRD + "
+                "roadmap before anyone writes code.",
+        "herald": "Herald writes user-facing docs (README, ARCHITECTURE, CHANGELOG). Not the same "
+                  "as a normal README — it verifies claims against the actual code.",
+        "phase": "A phase is a shippable slice of the project. Each phase ends with something "
+                 "a user can actually try. Phases run one at a time.",
+        "tmux": "tmux is a tool that lets long-running jobs keep running even if you close the "
+                "terminal. Shift uses it so CAE builds don't die when you step away.",
+        "env-vars": "Environment variables are secrets (API keys, passwords) that code needs but "
+                    "shouldn't be in the code itself. Shift collects them and stores them in a file "
+                    "called `.env` that stays on your machine, never in GitHub.",
+    }
+    print(explainers.get(topic, f"I don't have a built-in explainer for '{topic}'. "
+                                 f"Try one of: cae, forge, sentinel, scout, arch, herald, phase, tmux, env-vars."))
+
+
+# ─── Entrypoint ────────────────────────────────────────────────────────
+HELP_TEXT = """shift — proactive AI mentor (v{v})
+
+Usage:
+  shift new <name> [--dir <path>]   Start a new project intake.
+  shift resume [project]            Resume an existing project.
+  shift next                        Propose + execute the next action.
+  shift status                      Print done/in-progress/blocked/next.
+  shift help                        Read current state, offer 3 fixes.
+  shift learn <topic>               Teach about a CAE concept.
+  shift version                     Print version.
+
+Env (non-interactive / scripted use):
+  SHIFT_NONINTERACTIVE=1            Skip input() prompts; use defaults.
+  SHIFT_ANSWERS=<path-to-json>      Pre-supplied answers keyed by question id.
+  SHIFT_AUTO_APPROVE=1              Auto-approve every confirmation gate.
+  SHIFT_PROJECTS_HOME=<path>        Default base dir for new projects (~/projects).
+""".format(v=VERSION)
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        if state_path_for(Path.cwd()).exists():
+            cmd_help_contextual([])
+        else:
+            print(HELP_TEXT)
+        return
+    if argv[0] in ("-v", "--version", "version"):
+        print(f"shift {VERSION}")
+        return
+    if argv[0] == "help":
+        # `shift help [project]` — contextual; falls back to generic if none.
+        rest = argv[1:]
+        try:
+            cmd_help_contextual(rest)
+        except SystemExit:
+            print(HELP_TEXT)
+        return
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd == "new":
+        cmd_new(rest)
+    elif cmd == "resume":
+        cmd_resume(rest)
+    elif cmd == "next":
+        cmd_next(rest)
+    elif cmd == "status":
+        cmd_status(rest)
+    elif cmd == "learn":
+        cmd_learn(rest)
+    else:
+        die(f"unknown command: {cmd}. Run `shift help` for usage.")
+
+
+if __name__ == "__main__":
+    main()
