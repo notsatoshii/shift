@@ -554,9 +554,11 @@ def phase_prd(state: dict) -> None:
     )
 
     scout_brief = ""
-    scout_path = proj_dir / state["research"].get("scout_brief_path", "")
-    if scout_path.exists():
-        scout_brief = scout_path.read_text()[:6000]
+    brief_rel = state["research"].get("scout_brief_path", "")
+    if brief_rel:
+        scout_path = proj_dir / brief_rel
+        if scout_path.is_file():
+            scout_brief = scout_path.read_text()[:6000]
 
     work_dir = proj_dir / ".shift" / "arch"
     work_dir.mkdir(parents=True, exist_ok=True)
